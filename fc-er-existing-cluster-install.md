@@ -1,4 +1,4 @@
-# 115TC059Q 既有叢集安裝手冊（規格二、第 3～7 項）
+# 115TC059Q 既有叢集安裝手冊（規格二、第 2～7 項）
 
 > 院方叢集：**K8s v1.25.6**，16 節點（k8sm01–03 master、dgx01–04 GPU、hp04–hp10 一般節點、ac922-01/02 為 POWER9 / ppc64le）。
 > 前提：你有 `kubectl`（cluster-admin）與 `helm`，在 k8sm01 上以 root 操作。
@@ -14,9 +14,10 @@
 |---|---|---|---|---|
 | 1 | 4 | cert-manager（範例網站） | 30445 | `https://<NODE_IP>:30445` |
 | 2 | 3 | Keycloak | 30443 | `https://<NODE_IP>:30443/admin` |
-| 3 | 5 | Harbor | 30003（HTTPS）/ 30002（HTTP→轉 HTTPS） | `https://<NODE_IP>:30003` |
+| 3 | 5（+3 SSO） | Harbor（Keycloak 單一登入） | 30003（HTTPS）/ 30002（HTTP→轉 HTTPS） | `https://<NODE_IP>:30003` |
 | 4 | 6 | Loki + Alloy + Grafana | 30446 | `http://<NODE_IP>:30446` |
 | 5 | 7 | Headlamp | 30444 | `http://<NODE_IP>:30444` |
+| 6 | 2 | 多副本 + 負載平衡驗證（nginx × 3） | 30447 | `http://<NODE_IP>:30447` |
 
 > cert-manager 先裝，Keycloak 與 Harbor 的 HTTPS 憑證都由它簽發。
 
@@ -66,6 +67,10 @@ export PROM_URL="TODO"                  # 既有 Prometheus 叢集內網址，0.
 export HEADLAMP_NS="headlamp"
 export HEADLAMP_CHART_VERSION="0.45.0"
 export HEADLAMP_NODEPORT="30444"
+
+# ===== 規格 2：多副本 + 負載平衡 =====
+export LB_DEMO_NS="lb-demo"
+export LB_DEMO_NODEPORT="30447"
 EOF
 
 # 若之前已建立 phase1/phase2 變數檔，自動沿用 NODE_IP / PROM_URL
@@ -124,7 +129,7 @@ kubectl version
 kubectl get nodes -L kubernetes.io/arch,node-role.kubernetes.io/gpu   # ac922=ppc64le、DGX 有 gpu role
 kubectl get sc                                                        # 需要 (default)，否則填 STORAGECLASS
 # NodePort 是否被佔用
-kubectl get svc -A | grep -E ":(30002|30003|30443|30444|30445|30446)/" || echo "NodePort 皆未被佔用"
+kubectl get svc -A | grep -E ":(30002|30003|30443|30444|30445|30446|30447)/" || echo "NodePort 皆未被佔用"
 # 既有元件
 kubectl get crd | grep cert-manager.io || echo "未安裝 cert-manager"
 kubectl -n kube-system get pods | grep metrics-server || echo "沒有 metrics-server"
@@ -711,7 +716,7 @@ grep -n "config_path" /etc/containerd/config.toml
 ```
 
 > - `config_path` 有指到 `/etc/containerd/certs.d`：不需重啟，立即生效。
-> - **沒有** `config_path`（舊版 kubespray）：改用系統信任 —
+> - **沒有** `config_path`：改用系統信任 —
 >   `cp ~/fc-er/fc-er-root-ca.crt /usr/local/share/ca-certificates/fc-er-root-ca.crt && update-ca-certificates && systemctl restart containerd`。
 >   重啟 containerd 不會停掉執行中的容器，但**仍請先取得院方同意**，且只做在 DEMO 節點。
 
@@ -726,7 +731,7 @@ ssh ${HARBOR_DEMO_NODE} "mv /etc/containerd/certs.d/${HARBOR_ADDR}/fc-er-root-ca
 
 ### 3.6 推送 image（📸 規格 5：存放映像檔）
 
-kubespray 預設會裝 `nerdctl`，用它推送：
+有 `nerdctl` 就用它推送（沒有的話用下方 `ctr`）：
 
 ```bash
 which nerdctl || echo "沒有 nerdctl，改用下方 ctr 指令"
@@ -799,6 +804,184 @@ kubectl -n harbor-demo get events --sort-by=.lastTimestamp | grep -E "Pulling|Pu
 
 截完圖可以刪除測試：`kubectl delete ns harbor-demo`
 
+### 3.9 Harbor 單一登入：接 Keycloak OIDC（規格 3）
+
+流程：在 Keycloak 建 realm / 群組 / 測試帳號 / `harbor` client → 讓 Harbor 信任 Keycloak 的憑證 → Harbor 切換成 OIDC 登入。
+
+> - Harbor 只有在**還沒有其他本機使用者**（admin 以外）時才能切換成 OIDC。若已建過本機帳號，先在 Harbor UI → Users 刪除。
+> - 切換後 `admin` 仍可用本機密碼登入（UI 與 CLI），作為緊急管理帳號。
+> - 目前帳號建在 Keycloak 本機；之後 Keycloak 接 AD（User Federation）時，Harbor 這邊不用改。
+
+#### 3.9.1 變數與密碼
+
+```bash
+source ~/fc-er/env.sh && source ~/fc-er/secrets.sh
+# 舊的 env.sh 沒有這幾個變數就補上
+grep -q '^export KC_REALM=' ~/fc-er/env.sh || cat <<'EOF' >> ~/fc-er/env.sh
+
+# ===== Harbor SSO（Keycloak OIDC）=====
+export KC_REALM="fc-er"
+export KC_ISSUER="${KC_URL}/realms/${KC_REALM}"
+export HARBOR_ADMIN_GROUP="harbor-admins"     # 這個群組的人登入 Harbor 會是管理者
+export KC_TEST_ADMIN="eradmin01"
+export KC_TEST_USER="eruser01"
+EOF
+source ~/fc-er/env.sh
+add_secret() { local n=$1 v=${!1}; grep -q "^export ${n}=" ~/fc-er/secrets.sh && return; [[ -n "$v" ]] || v=$(eval "$2"); echo "export ${n}=\"${v}\"" >> ~/fc-er/secrets.sh; }
+add_secret HARBOR_OIDC_SECRET 'openssl rand -hex 24'
+add_secret KC_TEST_PASSWORD   'echo "Er$(openssl rand -hex 6)A9"'
+source ~/fc-er/secrets.sh
+echo "issuer=${KC_ISSUER}"
+
+# Keycloak 憑證的 CA（cert-manager 簽的取 ca.crt；openssl 自簽的直接用 tls.crt）
+kubectl -n ${KC_NS} get secret keycloak-tls -o jsonpath='{.data.ca\.crt}' | base64 -d > ~/fc-er/keycloak-ca.crt
+[[ -s ~/fc-er/keycloak-ca.crt ]] || \
+  kubectl -n ${KC_NS} get secret keycloak-tls -o jsonpath='{.data.tls\.crt}' | base64 -d > ~/fc-er/keycloak-ca.crt
+openssl x509 -in ~/fc-er/keycloak-ca.crt -noout -subject
+curl -s --cacert ~/fc-er/keycloak-ca.crt ${KC_URL}/realms/master | jq -r .realm   # master
+```
+
+#### 3.9.2 Keycloak：realm、群組、測試帳號、harbor client
+
+用 Keycloak Admin REST API 建立（也可以在管理介面手動建，結果相同）。
+
+```bash
+KC_CURL() { curl -s --cacert ~/fc-er/keycloak-ca.crt -H "Authorization: Bearer ${KC_TOKEN}" -H "Content-Type: application/json" "$@"; }
+KC_TOKEN=$(curl -s --cacert ~/fc-er/keycloak-ca.crt \
+  -d grant_type=password -d client_id=admin-cli \
+  -d username=admin --data-urlencode "password=${KC_ADMIN_PASSWORD}" \
+  ${KC_URL}/realms/master/protocol/openid-connect/token | jq -r .access_token)
+[[ "${KC_TOKEN}" != "null" && -n "${KC_TOKEN}" ]] && echo "取得 admin token" || echo "登入失敗：確認 KC_ADMIN_PASSWORD"
+KA="${KC_URL}/admin/realms"
+
+# ① realm（已存在會回 409，可忽略）
+KC_CURL -X POST ${KA} -d "{\"realm\":\"${KC_REALM}\",\"enabled\":true,\"displayName\":\"FC-ER\"}" -w "realm: %{http_code}\n"
+
+# ② 群組
+KC_CURL -X POST ${KA}/${KC_REALM}/groups -d "{\"name\":\"${HARBOR_ADMIN_GROUP}\"}" -w "group: %{http_code}\n"
+GID=$(KC_CURL "${KA}/${KC_REALM}/groups?search=${HARBOR_ADMIN_GROUP}" | jq -r '.[0].id')
+
+# ③ 測試帳號：eradmin01（加入 harbor-admins）、eruser01（一般使用者）
+for u in ${KC_TEST_ADMIN} ${KC_TEST_USER}; do
+  KC_CURL -X POST ${KA}/${KC_REALM}/users -d "{
+    \"username\":\"${u}\",\"enabled\":true,\"emailVerified\":true,
+    \"email\":\"${u}@fc-er.internal\",\"firstName\":\"${u}\",\"lastName\":\"FC-ER\",
+    \"credentials\":[{\"type\":\"password\",\"value\":\"${KC_TEST_PASSWORD}\",\"temporary\":false}]}" \
+    -w "user ${u}: %{http_code}\n"
+done
+UID_ADMIN=$(KC_CURL "${KA}/${KC_REALM}/users?username=${KC_TEST_ADMIN}&exact=true" | jq -r '.[0].id')
+KC_CURL -X PUT ${KA}/${KC_REALM}/users/${UID_ADMIN}/groups/${GID} -w "join group: %{http_code}\n"   # 204
+
+# ④ harbor client（confidential），附 groups mapper 讓 token 帶群組
+KC_CURL -X POST ${KA}/${KC_REALM}/clients -d "{
+  \"clientId\":\"harbor\",\"name\":\"Harbor\",\"enabled\":true,
+  \"protocol\":\"openid-connect\",\"publicClient\":false,
+  \"secret\":\"${HARBOR_OIDC_SECRET}\",
+  \"standardFlowEnabled\":true,\"directAccessGrantsEnabled\":false,
+  \"redirectUris\":[\"${HARBOR_URL}/c/oidc/callback\"],
+  \"webOrigins\":[\"${HARBOR_URL}\"],
+  \"protocolMappers\":[{
+    \"name\":\"groups\",\"protocol\":\"openid-connect\",
+    \"protocolMapper\":\"oidc-group-membership-mapper\",
+    \"config\":{\"full.path\":\"false\",\"id.token.claim\":\"true\",
+      \"access.token.claim\":\"true\",\"userinfo.token.claim\":\"true\",
+      \"claim.name\":\"groups\"}}]}" -w "client: %{http_code}\n"
+
+# 確認
+KC_CURL "${KA}/${KC_REALM}/clients?clientId=harbor" | jq '.[0] | {clientId, redirectUris}'
+curl -s --cacert ~/fc-er/keycloak-ca.crt ${KC_ISSUER}/.well-known/openid-configuration | jq -r .issuer
+```
+
+> 若 client 已存在（409）而 secret 不同，到 Keycloak 管理介面 → Clients → harbor → Credentials 複製 secret，更新 `secrets.sh` 的 `HARBOR_OIDC_SECRET`。
+
+#### 3.9.3 讓 Harbor 信任 Keycloak 憑證
+
+```bash
+kubectl -n ${HARBOR_NS} create secret generic harbor-oidc-ca \
+  --from-file=ca.crt=$HOME/fc-er/keycloak-ca.crt \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+helm upgrade harbor harbor/harbor -n ${HARBOR_NS} --version ${HARBOR_CHART_VERSION} \
+  --reuse-values --set caBundleSecretName=harbor-oidc-ca --wait --timeout 10m
+kubectl -n ${HARBOR_NS} rollout status deploy/harbor-core
+
+# Harbor core Pod 內測試能否連到 Keycloak（NodePort 回連）
+# 從叢集內 Pod 測試能否回連 Keycloak 的 NodePort（Harbor core 也是從 Pod 連出去）
+kubectl run kctest --rm -it --restart=Never --image=curlimages/curl:8.10.1 \
+  --overrides='{"spec":{"nodeSelector":{"kubernetes.io/arch":"amd64"}}}' -- \
+  curl -sk -o /dev/null -w "%{http_code}\n" ${KC_ISSUER}/.well-known/openid-configuration   # 200
+```
+
+#### 3.9.4 Harbor 切換為 OIDC 登入
+
+```bash
+hcurl() { curl -s --cacert ~/fc-er/fc-er-root-ca.crt -u "admin:${HARBOR_ADMIN_PASSWORD}" -H "Content-Type: application/json" "$@"; }
+
+# 先測試 Harbor 到 OIDC Server 的連線（對應 UI 的「Test OIDC Server」）
+hcurl -X POST ${HARBOR_URL}/api/v2.0/system/oidc/ping \
+  -d "{\"url\":\"${KC_ISSUER}\",\"verify_cert\":true}" -w "oidc ping: %{http_code}\n"   # 200
+
+cat <<EOF > ~/fc-er/harbor-oidc.json
+{
+  "auth_mode": "oidc_auth",
+  "oidc_name": "Keycloak",
+  "oidc_endpoint": "${KC_ISSUER}",
+  "oidc_client_id": "harbor",
+  "oidc_client_secret": "${HARBOR_OIDC_SECRET}",
+  "oidc_scope": "openid,profile,email,offline_access",
+  "oidc_verify_cert": true,
+  "oidc_auto_onboard": true,
+  "oidc_user_claim": "preferred_username",
+  "oidc_groups_claim": "groups",
+  "oidc_admin_group": "${HARBOR_ADMIN_GROUP}"
+}
+EOF
+chmod 600 ~/fc-er/harbor-oidc.json
+hcurl -X PUT ${HARBOR_URL}/api/v2.0/configurations -d @$HOME/fc-er/harbor-oidc.json -w "config: %{http_code}\n"   # 200
+hcurl ${HARBOR_URL}/api/v2.0/configurations | jq '{auth_mode: .auth_mode.value, oidc_endpoint: .oidc_endpoint.value, oidc_admin_group: .oidc_admin_group.value}'
+```
+
+> 若回 400 / `auth mode can not be modified`：Harbor 已有其他本機使用者，先刪除後再執行。
+
+#### 3.9.5 登入測試
+
+1. 瀏覽器開 `https://<NODE_IP>:30003` → 按 **LOGIN VIA OIDC PROVIDER**
+2. 跳轉到 Keycloak（`https://<NODE_IP>:30443/realms/fc-er/...`）→ 輸入 `eradmin01` / `KC_TEST_PASSWORD`
+3. 回到 Harbor，右上角顯示 `eradmin01`，左側有 **Administration** 選單（因為在 `harbor-admins` 群組）
+4. 登出，改用 `eruser01` 登入 → 沒有 Administration 選單（一般使用者）
+
+CLI（docker / nerdctl）登入要用 **CLI secret**，不是 Keycloak 密碼：Harbor 右上角使用者 → **User Profile** → 複製 CLI secret。
+
+```bash
+echo "<CLI secret>" | nerdctl login ${HARBOR_ADDR} -u eradmin01 --password-stdin
+```
+
+```bash
+echo "eradmin01 / eruser01 密碼：${KC_TEST_PASSWORD}"
+```
+
+#### 3.9.6 📸 規格 3：Harbor 單一登入截圖
+
+| # | 畫面 |
+|---|---|
+| ① | Harbor → Administration → Configuration → Authentication：Auth Mode = **OIDC**，按 **Test OIDC Server** 成功 |
+| ② | Harbor 登入頁的 **LOGIN VIA OIDC PROVIDER** 按鈕 |
+| ③ | 跳轉後的 Keycloak 登入頁（網址列可見 `:30443/realms/fc-er`） |
+| ④ | 回到 Harbor，右上角為 `eradmin01`，可見 Administration |
+| ⑤ | Harbor → Administration → Users：`eradmin01`、`eruser01` 自動建立（auto onboard） |
+| ⑥ | Keycloak → Clients → `harbor`（Valid redirect URI 為 `https://<NODE_IP>:30003/c/oidc/callback`） |
+| ⑦ | Keycloak → Users / Groups：`eradmin01` 屬於 `harbor-admins` |
+
+#### 3.9.7 常見問題
+
+| 狀況 | 排查 |
+|---|---|
+| OIDC ping 失敗 / `x509: certificate signed by unknown authority` | `harbor-oidc-ca` 的 CA 不對，或 helm upgrade 沒帶到 `caBundleSecretName`（`kubectl -n harbor get deploy harbor-core -o yaml \| grep -i ca`） |
+| Harbor core 連不到 Keycloak（timeout） | Pod 回連 `NODE_IP:30443` 被擋；可把 `oidc_endpoint` 先換成叢集內 Service 測試，但 issuer 必須與 Keycloak `KC_HOSTNAME` 一致，最終仍需能用 NodePort 網址連通 |
+| Keycloak 顯示 `Invalid parameter: redirect_uri` | client 的 redirect URI 與 `HARBOR_URL` 不一致（IP、port 要完全相同） |
+| 登入後 Harbor 顯示 `unauthorized` / secret 錯誤 | `HARBOR_OIDC_SECRET` 與 Keycloak client 的 secret 不一致 |
+| 登入成功但不是管理者 | token 沒有 `groups` claim，或群組名稱與 `oidc_admin_group` 不同；用 Keycloak → Clients → harbor → Client scopes → Evaluate 檢查 token 內容 |
+
 ---
 
 ## 4. 監控：Loki + Alloy + Grafana Dashboard（規格 6）
@@ -821,15 +1004,21 @@ helm repo add grafana https://grafana.github.io/helm-charts
 helm repo update
 ```
 
-### 4.1 Loki（Monolithic，檔案系統儲存）
+### 4.1 Loki（SingleBinary，檔案系統儲存）
 
 ```bash
+# loki-gateway（nginx）要知道叢集 DNS Service 的名稱；名稱不符會回 502 Bad Gateway
+DNS_SVC=$(kubectl -n kube-system get svc -o name | grep -oE 'kube-dns|coredns' | head -1)
+echo "DNS Service: ${DNS_SVC:?找不到 kube-dns / coredns，請用 kubectl -n kube-system get svc 確認}"
 {
-cat <<'EOF'
+cat <<EOF
 global:
-  dnsService: coredns          # kubespray 的 DNS Service 叫 coredns（chart 預設 kube-dns，會讓 loki-gateway 回 502）
+  dnsService: ${DNS_SVC}
   dnsNamespace: kube-system
-deploymentMode: Monolithic
+EOF
+cat <<'EOF'
+# chart 7.3.0 實測：Monolithic 不會產生 single-binary Pod，gateway 會去找 loki-distributor → 502
+deploymentMode: SingleBinary
 loki:
   auth_enabled: false
   commonConfig:
@@ -889,7 +1078,8 @@ EOF
 
 helm upgrade --install loki grafana-community/loki -n ${MON_NS} \
   --version ${LOKI_CHART_VERSION} -f ~/fc-er/loki-values.yaml --wait --timeout 10m
-kubectl -n ${MON_NS} get pods,svc,pvc -o wide | grep -i loki    # 確認有 loki-gateway Service
+kubectl -n ${MON_NS} get pods,svc,pvc -o wide | grep -i loki    # 要看到 loki-0（1/1）與 loki-gateway
+kubectl -n ${MON_NS} get cm loki-gateway -o yaml | grep -oE 'loki[a-z-]*\.'"${MON_NS}"'\.svc' | sort -u   # gateway 轉送目標應為 loki.<ns>.svc，不能是 loki-distributor
 ```
 
 > 若 helm 回報欄位錯誤，用 `helm show values grafana-community/loki --version ${LOKI_CHART_VERSION}` 對照（chart 7.x 改版較大）。
@@ -1258,11 +1448,196 @@ spec:
 
 ---
 
-## 附錄 A：驗收截圖總表（規格二、第 3～7 項）
+## 6. 容器平台：多副本與負載平衡（規格 2）
+
+規格原文：「建置 Kubernetes 容器管理平台，可於平台建立多副本之容器服務，確保服務連線可負載平衡分散流量處理。」
+
+驗證方式：部署 3 副本的 nginx（分散在不同節點），每個回應都帶上「是哪個 Pod 回的」，再從叢集內與叢集外大量連線，統計流量是否平均分到各副本；最後示範副本故障自動補回與擴充副本數。
+
+### 6.1 部署多副本服務（NodePort 30447）
+
+```bash
+source ~/fc-er/env.sh && source ~/fc-er/secrets.sh
+# 舊的 env.sh 沒有這兩個變數就補上
+grep -q '^export LB_DEMO_NS=' ~/fc-er/env.sh || cat <<'EOF' >> ~/fc-er/env.sh
+
+# ===== 規格 2：多副本 + 負載平衡 =====
+export LB_DEMO_NS="lb-demo"
+export LB_DEMO_NODEPORT="30447"
+EOF
+source ~/fc-er/env.sh
+kubectl get svc -A | grep -q ":${LB_DEMO_NODEPORT}/" && echo "⚠️ ${LB_DEMO_NODEPORT} 已被佔用，請改 LB_DEMO_NODEPORT"
+
+kubectl create ns ${LB_DEMO_NS} --dry-run=client -o yaml | kubectl apply -f -
+
+cat <<EOF > ~/fc-er/lb-demo.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lb-demo-nginx
+  namespace: ${LB_DEMO_NS}
+data:
+  default.conf: |
+    server {
+      listen 80;
+      location / {
+        default_type text/plain;
+        # 回應帶出 Pod 名稱與 Pod IP，用來判斷流量被分到哪個副本
+        return 200 "pod=\$hostname ip=\$server_addr\n";
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lb-demo
+  namespace: ${LB_DEMO_NS}
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: lb-demo}
+  template:
+    metadata:
+      labels: {app: lb-demo}
+    spec:
+      affinity:
+$(sed 's/^/        /' ~/fc-er/affinity-amd64.yaml)
+      # 盡量把副本分散到不同節點
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {app: lb-demo}
+      containers:
+        - name: nginx
+          image: nginx:1.27
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet: {path: /, port: 80}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          volumeMounts:
+            - {name: conf, mountPath: /etc/nginx/conf.d}
+      volumes:
+        - name: conf
+          configMap: {name: lb-demo-nginx}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lb-demo
+  namespace: ${LB_DEMO_NS}
+spec:
+  type: NodePort
+  selector: {app: lb-demo}
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: ${LB_DEMO_NODEPORT}
+EOF
+kubectl apply -f ~/fc-er/lb-demo.yaml
+kubectl -n ${LB_DEMO_NS} rollout status deploy/lb-demo
+```
+
+> nginx 設定裡的 `\$hostname`、`\$server_addr` 前面有反斜線，是為了不被 shell 展開；寫進檔案後會是 nginx 變數 `$hostname`、`$server_addr`。
+
+### 6.2 驗證：多副本（📸）
+
+```bash
+# ① Deployment / ReplicaSet / Pod：3/3 Ready，NODE 欄位分散在不同節點
+kubectl -n ${LB_DEMO_NS} get deploy,rs,pods -o wide
+
+# ② Service 與 Endpoints：後端有 3 個 Pod IP
+kubectl -n ${LB_DEMO_NS} get svc lb-demo -o wide
+kubectl -n ${LB_DEMO_NS} get endpoints lb-demo -o wide
+kubectl -n ${LB_DEMO_NS} describe svc lb-demo | grep -E "Type|NodePort|Endpoints"
+```
+
+### 6.3 驗證：負載平衡（📸）
+
+```bash
+# ③ 叢集內：經 Service（ClusterIP）連 60 次，統計每個 Pod 收到幾次
+kubectl -n ${LB_DEMO_NS} run lbtest --rm -i --restart=Never --image=curlimages/curl:8.10.1 \
+  --overrides='{"spec":{"nodeSelector":{"kubernetes.io/arch":"amd64"}}}' -- \
+  sh -c 'for i in $(seq 1 60); do curl -s http://lb-demo; done' | sort | uniq -c
+
+# ④ 叢集外：經 NodePort 連 60 次（在 k8sm01 或自己的電腦執行）
+for i in $(seq 1 60); do curl -s http://${NODE_IP}:${LB_DEMO_NODEPORT}/; done | sort | uniq -c
+
+# ⑤ 換一台節點的 IP 連同一個 NodePort，一樣會分散到 3 個 Pod（任何節點都能當入口）
+OTHER_NODE_IP=$(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' \
+  -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' \
+  | grep -v "^${NODE_IP}$" | head -1)
+echo "另一個入口：${OTHER_NODE_IP}"
+for i in $(seq 1 60); do curl -s http://${OTHER_NODE_IP}:${LB_DEMO_NODEPORT}/; done | sort | uniq -c
+```
+
+預期結果：3 個 `pod=lb-demo-xxxxx` 各約 20 次（kube-proxy 為隨機分配，數字不會完全相同，三個都有出現即代表流量被分散）。
+
+### 6.4 驗證：副本故障自動補回（📸）
+
+```bash
+# 背景持續打流量，同時刪掉一個 Pod
+( for i in $(seq 1 40); do curl -s -m 2 http://${NODE_IP}:${LB_DEMO_NODEPORT}/ || echo "FAILED"; sleep 0.5; done ) > /tmp/lb-failover.log &
+sleep 3
+VICTIM=$(kubectl -n ${LB_DEMO_NS} get pods -l app=lb-demo -o jsonpath='{.items[0].metadata.name}')
+echo "刪除 ${VICTIM}"
+kubectl -n ${LB_DEMO_NS} delete pod ${VICTIM} --wait=false
+wait
+
+# ⑥ 服務沒有中斷（FAILED 應為 0 或極少），流量自動轉到其他副本
+sort /tmp/lb-failover.log | uniq -c
+# ⑦ Deployment 自動補回第 3 個副本（新 Pod 的 AGE 很短）
+kubectl -n ${LB_DEMO_NS} get pods -o wide
+kubectl -n ${LB_DEMO_NS} get events --sort-by=.lastTimestamp | tail -8
+```
+
+### 6.5 驗證：擴充副本數（📸）
+
+```bash
+kubectl -n ${LB_DEMO_NS} scale deploy/lb-demo --replicas=5
+kubectl -n ${LB_DEMO_NS} rollout status deploy/lb-demo
+kubectl -n ${LB_DEMO_NS} get pods -o wide
+kubectl -n ${LB_DEMO_NS} get endpoints lb-demo        # 5 個 Pod IP
+for i in $(seq 1 100); do curl -s http://${NODE_IP}:${LB_DEMO_NODEPORT}/; done | sort | uniq -c   # 5 個 Pod 都有分到
+
+# 截完圖縮回 3 副本，或直接刪除
+kubectl -n ${LB_DEMO_NS} scale deploy/lb-demo --replicas=3
+# kubectl delete ns ${LB_DEMO_NS}
+```
+
+> 也可以在 Headlamp（第 5 章）→ Workloads → Deployments → `lb-demo` 用 UI 調整 Replicas，同時當作規格 7 的截圖。
+
+### 6.6 📸 規格 2 截圖清單
+
+| # | 畫面 | 對應原文 |
+|---|---|---|
+| ① | `kubectl get nodes -o wide`（叢集節點與版本） | 建置 Kubernetes 容器管理平台 |
+| ② | `kubectl -n lb-demo get deploy,rs,pods -o wide`（3/3，分散在不同節點） | 建立多副本之容器服務 |
+| ③ | `kubectl -n lb-demo get svc,endpoints -o wide`（NodePort 30447、3 個 Endpoint） | 服務連線 |
+| ④ | 叢集內 60 次連線的 `uniq -c` 統計（3 個 Pod 都有分到） | 負載平衡分散流量 |
+| ⑤ | 叢集外經 NodePort 60 次連線的 `uniq -c` 統計 | 負載平衡分散流量 |
+| ⑥ | 刪除 Pod 期間的連線紀錄（無中斷）＋ 自動補回的新 Pod | 確保服務連線 |
+| ⑦ | 擴充到 5 副本後的 Endpoints 與流量分布 | 多副本 |
+| — | 公司 **KCSP** 證明、執行工程師 **CKA** 證照影本（確認在有效期內） | 由 KCSP + CKA 工程師建置（文件佐證，非截圖） |
+
+---
+
+## 附錄 A：驗收截圖總表（規格二、第 2～7 項）
 
 | 規格 | 截圖 | 章節 |
 |---|---|---|
+| 2 容器管理平台 | `kubectl get nodes -o wide` | 6.6 |
+| 2 多副本 | `kubectl -n lb-demo get deploy,rs,pods -o wide`（3/3，分散節點） | 6.2 |
+| 2 負載平衡 | Endpoints 3 個 + 叢集內/外各 60 次連線 `uniq -c` | 6.3 |
+| 2 服務不中斷 | 刪 Pod 期間連線無中斷 + 自動補回 | 6.4 |
+| 2 KCSP / CKA | 證照影本（文件佐證） | 6.6 |
 | 3 帳號建立 | Keycloak realm / Users 清單 | 2.6 |
+| 3 Harbor 單一登入 | Harbor OIDC 設定、LOGIN VIA OIDC、Keycloak 登入、回到 Harbor | 3.9.6 |
 | 4 憑證管理系統 | `kubectl -n cert-manager get pods`、`kubectl get clusterissuer` | 1.3 |
 | 4 憑證簽發 | `kubectl get certificate -A`（cert-demo、keycloak、harbor 都 READY） | 1.3 |
 | 4 自動續期 | `describe certificate cert-demo-tls` 的 Revision 增加 | 1.3 |
@@ -1295,4 +1670,5 @@ spec:
 | Grafana 的 Prometheus 資料源失敗 | `PROM_URL` 錯誤，用 0.3 的 curl 測試同一個 URL |
 | Dashboard GPU 圖沒資料 | Prometheus 沒有 DCGM 指標，或節點標籤不是 `Hostname`（見 4.4） |
 | Logs 面板空白 | `kubectl -n fc-er-monitoring logs ds/alloy`；確認 `loki-gateway` Service 存在 |
-| NodePort 連不到 | 院方或節點防火牆擋了 30002/30003/30443–30446 |
+| NodePort 連不到 | 院方或節點防火牆擋了 30002/30003/30443–30447 |
+| lb-demo 流量只打到同一個 Pod | 確認 Endpoints 有 3 個 IP；curl 每次都是新連線才會重新分配（瀏覽器會沿用連線，請用 curl 迴圈測試） |
